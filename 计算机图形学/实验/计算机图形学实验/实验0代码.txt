@@ -1,0 +1,551 @@
+#include <glad/glad.h>
+#include <GLFW/glfw3.h>
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
+#include <iostream>
+#include <vector>
+
+// 窗口尺寸
+const unsigned int SCR_WIDTH = 800;
+const unsigned int SCR_HEIGHT = 600;
+
+// 图形数据结构
+struct Shape {
+    enum Type { TRIANGLE, CIRCLE } type;
+    std::vector<float> vertices;
+    unsigned int VAO, VBO;
+    glm::vec3 position;
+    float rotation;
+    float scale;
+    bool isDragging;
+    glm::vec2 dragStart; // x用于存储最后点击时间，y备用
+};
+
+// 控制按钮结构
+struct Button {
+    glm::vec2 position;
+    glm::vec2 size;
+    std::vector<float> vertices;
+    unsigned int VAO, VBO;
+    bool isPressed;
+    bool isActive; // 用于表示自动旋转是否开启
+};
+
+// 全局变量
+std::vector<Shape> shapes;
+Button rotateButton;
+int selectedShape = -1;
+bool isRotating = false;
+glm::vec2 rotationStart;
+bool autoRotate = false; // 自动旋转开关
+float lastFrameTime = 0.0f; // 用于计算帧时间
+
+// 着色器源码 - 顶点着色器保持不变
+const char *vertexShaderSource = "#version 330 core\n"
+    "layout (location = 0) in vec2 aPos;\n"
+    "out vec2 fragPos;\n"  // 向片段着色器传递局部位置
+    "uniform mat4 model;\n"
+    "uniform mat4 projection;\n"
+    "uniform int isButton;\n" // 标识是否为按钮
+    "void main()\n"
+    "{\n"
+    "   gl_Position = projection * model * vec4(aPos, 0.0, 1.0);\n"
+    "   fragPos = aPos;\n"
+    "}\0";
+
+// 片段着色器 - 增加了按钮颜色处理
+const char *fragmentShaderSource = "#version 330 core\n"
+    "in vec2 fragPos;\n"  // 接收来自顶点着色器的局部位置
+    "out vec4 FragColor;\n"
+    "uniform int isCircle;\n"  // 标识是否为圆形
+    "uniform int isButton;\n"  // 标识是否为按钮
+    "uniform bool buttonActive;\n" // 按钮激活状态
+    "void main()\n"
+    "{\n"
+    "   if(isButton == 1){\n"
+    "       // 按钮颜色 - 激活时为浅蓝色，否则为灰色\n"
+    "       if(buttonActive){\n"
+    "           FragColor = vec4(0.6, 0.8, 1.0, 1.0);\n"
+    "       } else {\n"
+    "           FragColor = vec4(0.7, 0.7, 0.7, 1.0);\n"
+    "       }\n"
+    "       // 按钮边框\n"
+    "       if(fragPos.x < -25.0 + 2.0 || fragPos.x > 25.0 - 2.0 || "
+    "          fragPos.y < -25.0 + 2.0 || fragPos.y > 25.0 - 2.0){\n"
+    "           FragColor = vec4(0.3, 0.3, 0.3, 1.0);\n"
+    "       }\n"
+    "   } else if(isCircle == 1){\n"
+    "       // 计算点与圆心连线的角度（弧度）\n"
+    "       float angle = atan(fragPos.y, fragPos.x);\n"
+    "       // 将角度转换为0-360度\n"
+    "       float degrees = angle * 180.0 / 3.1415926535;\n"
+    "       if(degrees < 0.0) degrees += 360.0;\n"
+    "       \n"
+    "       // 三分之一区域划分（每个区域120度）\n"
+    "       if(degrees < 120.0){\n"
+    "           FragColor = vec4(1.0, 0.8, 0.9, 1.0); // 浅粉色\n"
+    "       } else if(degrees < 240.0){\n"
+    "           FragColor = vec4(0.8, 0.9, 1.0, 1.0); // 浅蓝色\n"
+    "       } else {\n"
+    "           FragColor = vec4(1.0, 1.0, 0.8, 1.0); // 浅黄色\n"
+    "       }\n"
+    "   } else {\n"
+    "       // 三角形设置为浅绿色\n"
+    "       FragColor = vec4(0.8, 1.0, 0.8, 1.0);\n"
+    "   }\n"
+    "}\0";
+
+// 函数声明
+void framebuffer_size_callback(GLFWwindow* window, int width, int height);
+void mouse_button_callback(GLFWwindow* window, int button, int action, int mods);
+void cursor_position_callback(GLFWwindow* window, double xpos, double ypos);
+unsigned int compileShader(unsigned int type, const char* source);
+unsigned int createShaderProgram();
+void createTriangle(Shape& shape);
+void createCircle(Shape& shape, unsigned int segments = 72);
+void createButton(Button& button);
+bool isPointInShape(const glm::vec2& point, const Shape& shape);
+bool isPointInButton(const glm::vec2& point, const Button& button);
+glm::vec2 screenToWorld(const glm::vec2& screenPos);
+
+int main()
+{
+    // GLFW初始化
+    glfwInit();
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+
+    // 创建窗口
+    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, "OpenGL Shapes", NULL, NULL);
+    if (window == NULL)
+    {
+        std::cout << "Failed to create GLFW window" << std::endl;
+        glfwTerminate();
+        return -1;
+    }
+    glfwMakeContextCurrent(window);
+    glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
+    glfwSetMouseButtonCallback(window, mouse_button_callback);
+    glfwSetCursorPosCallback(window, cursor_position_callback);
+
+    // 初始化GLAD
+    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress))
+    {
+        std::cout << "Failed to initialize GLAD" << std::endl;
+        return -1;
+    }
+
+    // 启用混合（边缘平滑）
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    // 创建着色器程序
+    unsigned int shaderProgram = createShaderProgram();
+    if (!shaderProgram) return -1;
+
+    // 设置投影矩阵
+    glm::mat4 projection = glm::ortho(0.0f, (float)SCR_WIDTH, 0.0f, (float)SCR_HEIGHT, -1.0f, 1.0f);
+    glUseProgram(shaderProgram);
+    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(projection));
+
+    // 创建三角形
+    Shape triangle;
+    triangle.type = Shape::TRIANGLE;
+    triangle.position = glm::vec3(SCR_WIDTH / 3.0f, SCR_HEIGHT / 2.0f, 0.0f);
+    triangle.rotation = 0.0f;
+    triangle.scale = 1.0f;
+    triangle.isDragging = false;
+    createTriangle(triangle);
+    shapes.push_back(triangle);
+
+    // 创建圆形
+    Shape circle;
+    circle.type = Shape::CIRCLE;
+    circle.position = glm::vec3(2.0f * SCR_WIDTH / 3.0f, SCR_HEIGHT / 2.0f, 0.0f);
+    circle.rotation = 0.0f;
+    circle.scale = 1.0f;
+    circle.isDragging = false;
+    createCircle(circle);
+    shapes.push_back(circle);
+
+    // 创建自动旋转控制按钮（放置在窗口右上角）
+    rotateButton.position = glm::vec2(SCR_WIDTH - 60.0f, SCR_HEIGHT - 60.0f);
+    rotateButton.size = glm::vec2(50.0f, 50.0f);
+    rotateButton.isPressed = false;
+    rotateButton.isActive = false;
+    createButton(rotateButton);
+
+    // 获取uniform变量位置
+    int isCircleLoc = glGetUniformLocation(shaderProgram, "isCircle");
+    int isButtonLoc = glGetUniformLocation(shaderProgram, "isButton");
+    int buttonActiveLoc = glGetUniformLocation(shaderProgram, "buttonActive");
+
+    // 记录初始时间
+    lastFrameTime = glfwGetTime();
+
+    // 渲染循环
+    while (!glfwWindowShouldClose(window))
+    {
+        // 计算帧时间
+        float currentFrame = glfwGetTime();
+        float deltaTime = currentFrame - lastFrameTime;
+        lastFrameTime = currentFrame;
+
+        // 清屏 - 白色背景
+        glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        // 使用着色器程序
+        glUseProgram(shaderProgram);
+
+        // 如果自动旋转开启，更新所有图形的旋转角度
+        if (autoRotate)
+        {
+            for (auto& shape : shapes)
+            {
+                shape.rotation += 45.0f * deltaTime; // 每秒旋转45度
+                if (shape.rotation >= 360.0f)
+                    shape.rotation -= 360.0f;
+            }
+        }
+
+        // 绘制所有图形
+        for (size_t i = 0; i < shapes.size(); i++)
+        {
+            const Shape& shape = shapes[i];
+            
+            // 设置uniform变量
+            glUniform1i(isCircleLoc, shape.type == Shape::CIRCLE ? 1 : 0);
+            glUniform1i(isButtonLoc, 0); // 不是按钮
+            
+            // 创建模型矩阵
+            glm::mat4 model = glm::mat4(1.0f);
+            model = glm::translate(model, shape.position);
+            model = glm::rotate(model, glm::radians(shape.rotation), glm::vec3(0.0f, 0.0f, 1.0f));
+            model = glm::scale(model, glm::vec3(shape.scale, shape.scale, 1.0f));
+            
+            // 设置模型矩阵
+            glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "model"), 1, GL_FALSE, glm::value_ptr(model));
+            
+            // 绘制
+            glBindVertexArray(shape.VAO);
+            if (shape.type == Shape::TRIANGLE)
+            {
+                glDrawArrays(GL_TRIANGLES, 0, 3);
+            }
+            else if (shape.type == Shape::CIRCLE)
+            {
+                glDrawArrays(GL_TRIANGLE_FAN, 0, shape.vertices.size() / 2);
+            }
+        }
+
+        // 绘制控制按钮
+        glUseProgram(shaderProgram);
+        glUniform1i(isCircleLoc, 0); // 不是圆形
+        glUniform1i(isButtonLoc, 1); // 是按钮
+        glUniform1i(buttonActiveLoc, rotateButton.isActive ? 1 : 0);
+        
+        glm::mat4 buttonModel = glm::mat4(1.0f);
+        buttonModel = glm::translate(buttonModel, glm::vec3(rotateButton.position, 0.0f));
+        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "model"), 1, GL_FALSE, glm::value_ptr(buttonModel));
+        
+        glBindVertexArray(rotateButton.VAO);
+        glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+
+        // 交换缓冲并轮询事件
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+    }
+
+    // 清理资源
+    for (const auto& shape : shapes)
+    {
+        glDeleteVertexArrays(1, &shape.VAO);
+        glDeleteBuffers(1, &shape.VBO);
+    }
+    glDeleteVertexArrays(1, &rotateButton.VAO);
+    glDeleteBuffers(1, &rotateButton.VBO);
+    glDeleteProgram(shaderProgram);
+
+    glfwTerminate();
+    return 0;
+}
+
+// 窗口大小改变时的回调
+void framebuffer_size_callback(GLFWwindow* window, int width, int height)
+{
+    glViewport(0, 0, width, height);
+}
+
+// 鼠标按钮回调
+void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
+{
+    if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS)
+    {
+        double xpos, ypos;
+        glfwGetCursorPos(window, &xpos, &ypos);
+        glm::vec2 worldPos = screenToWorld(glm::vec2(xpos, ypos));
+
+        // 先检查是否点击了按钮
+        if (isPointInButton(worldPos, rotateButton))
+        {
+            // 切换自动旋转状态
+            autoRotate = !autoRotate;
+            rotateButton.isActive = autoRotate;
+            selectedShape = -1; // 取消图形选择
+            isRotating = false;
+            return;
+        }
+
+        // 检查是否点击了某个图形
+        selectedShape = -1;
+        for (int i = shapes.size() - 1; i >= 0; i--)
+        {
+            if (isPointInShape(worldPos, shapes[i]))
+            {
+                selectedShape = i;
+                
+                // 检查是否是双击
+                if (glfwGetTime() - shapes[i].dragStart.x < 0.3) // 0.3秒内双击
+                {
+                    isRotating = true;
+                    rotationStart = worldPos;
+                }
+                else
+                {
+                    isRotating = false;
+                    shapes[i].isDragging = true;
+                    shapes[i].dragStart = glm::vec2(worldPos.x - shapes[i].position.x, 
+                                                  worldPos.y - shapes[i].position.y);
+                }
+                
+                // 更新最后点击时间
+                shapes[i].dragStart.x = glfwGetTime();
+                break;
+            }
+        }
+    }
+    else if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_RELEASE)
+    {
+        if (selectedShape != -1)
+        {
+            shapes[selectedShape].isDragging = false;
+        }
+        isRotating = false;
+        rotateButton.isPressed = false;
+    }
+}
+
+// 鼠标移动回调
+void cursor_position_callback(GLFWwindow* window, double xpos, double ypos)
+{
+    if (selectedShape == -1) return;
+
+    glm::vec2 worldPos = screenToWorld(glm::vec2(xpos, ypos));
+    Shape& shape = shapes[selectedShape];
+
+    if (shape.isDragging)
+    {
+        // 拖动图形
+        shape.position.x = worldPos.x - shape.dragStart.x;
+        shape.position.y = worldPos.y - shape.dragStart.y;
+    }
+    else if (isRotating)
+    {
+        // 计算旋转角度（基于鼠标移动方向）
+        glm::vec2 center(shape.position.x, shape.position.y);
+        glm::vec2 startDir = rotationStart - center;
+        glm::vec2 currentDir = worldPos - center;
+        
+        float startAngle = atan2(startDir.y, startDir.x) * 180.0f / glm::pi<float>();
+        float currentAngle = atan2(currentDir.y, currentDir.x) * 180.0f / glm::pi<float>();
+        
+        shape.rotation += currentAngle - startAngle;
+        rotationStart = worldPos;
+    }
+}
+
+// 编译着色器
+unsigned int compileShader(unsigned int type, const char* source)
+{
+    unsigned int shader = glCreateShader(type);
+    glShaderSource(shader, 1, &source, NULL);
+    glCompileShader(shader);
+
+    // 检查编译错误
+    int success;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+    if (!success)
+    {
+        char infoLog[512];
+        glGetShaderInfoLog(shader, 512, NULL, infoLog);
+        std::cout << "Shader compilation error:\n" << infoLog << std::endl;
+        return 0;
+    }
+    return shader;
+}
+
+// 创建着色器程序
+unsigned int createShaderProgram()
+{
+    unsigned int vertexShader = compileShader(GL_VERTEX_SHADER, vertexShaderSource);
+    unsigned int fragmentShader = compileShader(GL_FRAGMENT_SHADER, fragmentShaderSource);
+    
+    if (!vertexShader || !fragmentShader) return 0;
+
+    unsigned int shaderProgram = glCreateProgram();
+    glAttachShader(shaderProgram, vertexShader);
+    glAttachShader(shaderProgram, fragmentShader);
+    glLinkProgram(shaderProgram);
+
+    // 检查链接错误
+    int success;
+    glGetProgramiv(shaderProgram, GL_LINK_STATUS, &success);
+    if (!success)
+    {
+        char infoLog[512];
+        glGetProgramInfoLog(shaderProgram, 512, NULL, infoLog);
+        std::cout << "Shader program linking error:\n" << infoLog << std::endl;
+        return 0;
+    }
+
+    glDeleteShader(vertexShader);
+    glDeleteShader(fragmentShader);
+
+    return shaderProgram;
+}
+
+// 创建三角形
+void createTriangle(Shape& shape)
+{
+    // 三角形顶点（居中在原点）
+    float vertices[] = {
+        0.0f,  50.0f,  // 上顶点
+       -50.0f, -50.0f,  // 左下
+        50.0f, -50.0f   // 右下
+    };
+
+    // 复制顶点数据
+    shape.vertices.assign(vertices, vertices + sizeof(vertices) / sizeof(float));
+
+    // 创建VAO和VBO
+    glGenVertexArrays(1, &shape.VAO);
+    glGenBuffers(1, &shape.VBO);
+    
+    glBindVertexArray(shape.VAO);
+    glBindBuffer(GL_ARRAY_BUFFER, shape.VBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+    
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
+}
+
+// 创建圆形
+void createCircle(Shape& shape, unsigned int segments)
+{
+    // 圆形顶点（居中在原点，使用三角形扇）
+    std::vector<float> vertices;
+    vertices.push_back(0.0f); // 中心x
+    vertices.push_back(0.0f); // 中心y
+
+    // 添加圆周上的点
+    for (unsigned int i = 0; i <= segments; i++)
+    {
+        float angle = 2.0f * glm::pi<float>() * (float)i / (float)segments;
+        float x = 50.0f * cos(angle); // 半径50
+        float y = 50.0f * sin(angle);
+        vertices.push_back(x);
+        vertices.push_back(y);
+    }
+
+    // 保存顶点数据
+    shape.vertices = vertices;
+
+    // 创建VAO和VBO
+    glGenVertexArrays(1, &shape.VAO);
+    glGenBuffers(1, &shape.VBO);
+    
+    glBindVertexArray(shape.VAO);
+    glBindBuffer(GL_ARRAY_BUFFER, shape.VBO);
+    glBufferData(GL_ARRAY_BUFFER, vertices.size() * sizeof(float), vertices.data(), GL_STATIC_DRAW);
+    
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
+}
+
+// 创建按钮（正方形）
+void createButton(Button& button)
+{
+    // 正方形顶点（居中在原点，50x50大小）
+    float vertices[] = {
+        -25.0f, -25.0f,  // 左下
+         25.0f, -25.0f,  // 右下
+         25.0f,  25.0f,  // 右上
+        -25.0f,  25.0f   // 左上
+    };
+
+    // 复制顶点数据
+    button.vertices.assign(vertices, vertices + sizeof(vertices) / sizeof(float));
+
+    // 创建VAO和VBO
+    glGenVertexArrays(1, &button.VAO);
+    glGenBuffers(1, &button.VBO);
+    
+    glBindVertexArray(button.VAO);
+    glBindBuffer(GL_ARRAY_BUFFER, button.VBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+    
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
+}
+
+// 检查点是否在图形内
+bool isPointInShape(const glm::vec2& point, const Shape& shape)
+{
+    // 将点转换到图形的局部坐标系
+    glm::vec2 localPoint = point - glm::vec2(shape.position.x, shape.position.y);
+    
+    // 简单的碰撞检测
+    if (shape.type == Shape::TRIANGLE)
+    {
+        // 三角形边界框检测
+        return (localPoint.x > -50 && localPoint.x < 50 &&
+                localPoint.y > -50 && localPoint.y < 50);
+    }
+    else if (shape.type == Shape::CIRCLE)
+    {
+        // 圆形碰撞检测（距离圆心小于半径）
+        return glm::length(localPoint) < 50;
+    }
+    
+    return false;
+}
+
+// 检查点是否在按钮内
+bool isPointInButton(const glm::vec2& point, const Button& button)
+{
+    // 按钮的边界检测
+    return (point.x >= button.position.x - button.size.x / 2 &&
+            point.x <= button.position.x + button.size.x / 2 &&
+            point.y >= button.position.y - button.size.y / 2 &&
+            point.y <= button.position.y + button.size.y / 2);
+}
+
+// 将屏幕坐标转换为世界坐标
+glm::vec2 screenToWorld(const glm::vec2& screenPos)
+{
+    // 翻转Y轴，因为OpenGL的Y轴向下为正
+    return glm::vec2(screenPos.x, SCR_HEIGHT - screenPos.y);
+}
+    
